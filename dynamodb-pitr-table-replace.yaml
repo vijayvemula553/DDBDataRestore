@@ -1,0 +1,445 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Deploys a DynamoDB PITR Rollback and Self-Healing solution (V8). This template
+  fixes the logic in DetermineSourceTableName to correctly default to the OriginalTableName
+  as the PITR source unless a specific backup table name is provided.
+  
+Parameters:
+  ApproverRoleName:
+    Type: String
+    Default: DDBRollbackApproverRole
+    Description: Name for the dedicated IAM role authorized to approve manual SSM steps.
+  AutomationAssumeRoleName:
+    Type: String
+    Default: DDBRollbackAutomationRole
+    Description: Name for the IAM role SSM Automation will assume.
+
+Resources:
+  
+  # ----------------------------------------------------------------------
+  # 0. S3 Bucket for Table Configuration Backup
+  # ----------------------------------------------------------------------
+  TableConfigBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain 
+    Properties:
+      BucketName: !Sub "ddb-config-backup-${AWS::StackName}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      
+  # ----------------------------------------------------------------------
+  # 1. IAM Roles 
+  # ----------------------------------------------------------------------
+  ApproverIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref ApproverRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root' } 
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: SSMManualApprovalPermission
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'ssm:SendAutomationSignal'
+                Resource: '*' 
+  
+  AutomationAssumeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref AutomationAssumeRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: 'ssm.amazonaws.com' }
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole
+      Policies:
+        - PolicyName: DDBRollbackPermissions
+          PolicyDocument: 
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeTable
+                  - dynamodb:RestoreTableToPointInTime
+                  - dynamodb:UpdateContinuousBackups
+                  - dynamodb:DeleteTable
+                  - dynamodb:TagResource 
+                  - dynamodb:UpdateTimeToLive 
+                  - dynamodb:UpdateTable 
+                  - dynamodb:DescribeTimeToLive
+                  - dynamodb:ListTagsOfResource
+                  - dynamodb:Scan
+                  - dynamodb:GetItem
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/*' 
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${TableConfigBucket}/*'
+
+  # ----------------------------------------------------------------------
+  # 2. SSM Automation Document (The core rollback logic)
+  # ----------------------------------------------------------------------
+  DynamoDBRollbackRunbook:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      DocumentFormat: YAML
+      # Incremented name to force replacement
+      Name: 'DDB_ROLLBACK_SELF_HEAL_V8' 
+      Content: 
+        !Sub |
+          schemaVersion: "0.3"
+          description: "DynamoDB PITR Rollback and Self-Healing Runbook"
+          assumeRole: "${AutomationAssumeRole.Arn}"
+          parameters:
+            OriginalTableName:
+              type: String
+              description: The name of the DynamoDB table to rollback/heal.
+            PITRTimestamp:
+              type: String
+              description: ISO timestamp to restore from PITR (e.g., 2025-12-10T23:59:35Z).
+            ApproverPrincipalArn:
+              type: String
+              description: The IAM principal (User/Role/Assumed Role ARN) authorized to approve the manual steps.
+              default: ""
+            BackupTableNameIfDeleted:
+              type: String
+              description: |
+                If the Original Table was deleted, provide the backup table name if known. 
+                Leave empty if the original table still exists.
+              default: ""
+          mainSteps:
+            
+
+            # ---------------------------------------------
+            # STEP 1: Determine Source Table Name
+            # ---------------------------------------------
+            - name: DetermineSourceTableName
+              action: aws:executeScript
+              inputs:
+                Runtime: python3.11
+                Handler: determine_name
+                Script: |
+                  def determine_name(events, context):
+                    table = events['OriginalTableName']
+                    backup_name_input = events['BackupTableNameIfDeleted']
+                    
+                    if backup_name_input:
+                      # If a backup name is provided, use it (assumes deleted scenario)
+                      source_table = backup_name_input
+                    else:
+                      # If no backup name is provided, use the original name as the source
+                      # (assumes corruption/self-heal scenario)
+                      source_table = table 
+
+                    return {'PITRSourceTable': source_table}
+                InputPayload:
+                  OriginalTableName: "{{ OriginalTableName }}"
+                  BackupTableNameIfDeleted: "{{ BackupTableNameIfDeleted }}"
+              outputs:
+                - Name: PITRSourceTable
+                  Selector: "$.Payload.PITRSourceTable"
+                  Type: String
+
+            # ---------------------------------------------
+            # STEP 2: Backup Configuration (Only if table exists)
+            # ---------------------------------------------
+            - name: BackupTableConfig
+              action: aws:executeScript
+              inputs:
+                Runtime: python3.11
+                Handler: backup_config
+                Script: |
+                  import boto3
+                  import json
+                  
+                  s3 = boto3.client('s3')
+                  ddb = boto3.client('dynamodb')
+
+                  def extract_config(table_description, ttl_description):
+                      config = {
+                          'TableName': table_description['TableName'],
+                          'BillingModeSummary': table_description.get('BillingModeSummary'),
+                          'GlobalSecondaryIndexes': [],
+                          'LocalSecondaryIndexes': table_description.get('LocalSecondaryIndexes', []),
+                          'SSESpecification': table_description.get('SSESpecification'),
+                          'StreamSpecification': table_description.get('StreamSpecification'),
+                          'Tags': ddb.list_tags_of_resource(ResourceArn=table_description['TableArn']).get('Tags', []),
+                          'TimeToLiveAttributeName': ttl_description.get('TimeToLiveDescription', {}).get('AttributeName')
+                      }
+                      for gsi in table_description.get('GlobalSecondaryIndexes', []):
+                          gsi_config = {
+                              'IndexName': gsi['IndexName'],
+                              'KeySchema': gsi['KeySchema'],
+                              'Projection': gsi['Projection'],
+                              'ProvisionedThroughput': gsi.get('ProvisionedThroughput') 
+                          }
+                          config['GlobalSecondaryIndexes'].append(gsi_config)
+                      return config
+
+                  def backup_config(events, context):
+                    table_name = events['OriginalTableName']
+                    bucket_name = events['BucketName']
+                    key = f"ddb-config/{table_name}-config.json"
+                    
+                    try:
+                        table_desc = ddb.describe_table(TableName=table_name)['Table']
+                        ttl_desc = ddb.describe_time_to_live(TableName=table_name)
+                        
+                        config = extract_config(table_desc, ttl_desc)
+                        
+                        s3.put_object(
+                            Bucket=bucket_name,
+                            Key=key,
+                            Body=json.dumps(config, default=str),
+                            ContentType='application/json'
+                        )
+                        return {"ConfigKey": key} 
+                    except ddb.exceptions.ResourceNotFoundException:
+                        print(f"Table {table_name} not found. Skipping config backup.")
+                        return {"ConfigKey": None}
+                    except Exception as e:
+                        print(f"Error during backup: {e}")
+                        raise
+
+                InputPayload:
+                  OriginalTableName: "{{ OriginalTableName }}"
+                  BucketName: "${TableConfigBucket}"
+              outputs:
+                - Name: ConfigKey
+                  Selector: "$.Payload.ConfigKey"
+                  Type: String
+              
+            # ---------------------------------------------
+            # STEP 3: Confirm Operation
+            # ---------------------------------------------
+            - name: AskForApproval
+              action: aws:approve
+              onFailure: Abort
+              inputs:
+                Message: "CONFIRM ROLLBACK: The original table '{{ OriginalTableName }}' will be DELETED and RECREATED from the PITR of '{{ DetermineSourceTableName.PITRSourceTable }}' at time '{{ PITRTimestamp }}'. Approve to continue."
+                Approvers:
+                  - "{{ ApproverPrincipalArn }}"
+                  
+            # ---------------------------------------------
+            # STEP 4: Restore PITR to a Temporary Table (The new source)
+            # ---------------------------------------------
+            - name: RestoreTableFromPITR
+              action: aws:executeScript
+              inputs:
+                Runtime: python3.11
+                Handler: restore_table
+                Script: |
+                  import boto3
+                  from datetime import datetime
+                  def restore_table(events, context):
+                    ddb = boto3.client('dynamodb')
+                    source_table = events['PITRSourceTable']
+                    restore_time_str = events['PITRTimestamp']
+                    restore_time = datetime.fromisoformat(restore_time_str.replace('Z', '+00:00'))
+                    target_table = events['OriginalTableName'] + '_RESTORED'
+                    
+                    print(f"Restoring table {source_table} to new table {target_table} at {restore_time_str}")
+
+                    ddb.restore_table_to_point_in_time(
+                        SourceTableName=source_table, 
+                        TargetTableName=target_table, 
+                        RestoreDateTime=restore_time 
+                    )
+                    return {'RestoredTable': target_table}
+                InputPayload:
+                  PITRSourceTable: "{{ DetermineSourceTableName.PITRSourceTable }}"
+                  PITRTimestamp: "{{ PITRTimestamp }}"
+                  OriginalTableName: "{{ OriginalTableName }}"
+              outputs:
+                - Name: RestoredTable
+                  Selector: "$.Payload.RestoredTable"
+                  Type: String
+                  
+            # ---------------------------------------------
+            # STEP 5: Wait for PITR Restore to complete
+            # ---------------------------------------------
+            - name: WaitForRestoredTableActive
+              action: aws:waitForAwsResourceProperty
+              timeoutSeconds: 86400
+              inputs:
+                Service: DynamoDb
+                Api: DescribeTable
+                PropertySelector: Table.TableStatus
+                DesiredValues: ["ACTIVE"]
+                TableName: "{{ RestoreTableFromPITR.RestoredTable }}"
+            
+            # ---------------------------------------------
+            # STEP 6: Delete Original Table (Only if it exists)
+            # ---------------------------------------------
+            - name: DeleteOriginalTable
+              action: aws:executeScript
+              inputs:
+                Runtime: python3.11
+                Handler: delete_table
+                Script: |
+                  import boto3
+                  def delete_table(events, context):
+                    ddb = boto3.client('dynamodb')
+                    table = events['OriginalTableName']
+                    try:
+                        ddb.delete_table(TableName=table)
+                        print(f"Successfully initiated deletion of table: {table}")
+                        return {'Status': 'Deletion Initiated'}
+                    except ddb.exceptions.ResourceNotFoundException:
+                        print(f"Table {table} does not exist. Skipping deletion.")
+                        return {'Status': 'Skipped'}
+                    except Exception as e:
+                        print(f"Error deleting table: {e}")
+                        raise
+                InputPayload:
+                  OriginalTableName: "{{ OriginalTableName }}"
+              outputs:
+                - Name: DeleteStatus
+                  Selector: "$.Payload.Status"
+                  Type: String
+              
+            # ---------------------------------------------
+            # STEP 7: Set Final Name (Placeholder/Context Step)
+            # ---------------------------------------------
+            - name: SetFinalTableName
+              action: aws:executeScript
+              inputs:
+                Runtime: python3.11
+                Handler: set_name
+                Script: |
+                  def set_name(events, context):
+                    return {'FinalTableName': events['OriginalTableName']}
+                InputPayload:
+                  OriginalTableName: "{{ OriginalTableName }}"
+              outputs:
+                - Name: FinalTableName
+                  Selector: "$.Payload.FinalTableName"
+                  Type: String
+            
+            # ---------------------------------------------
+            # STEP 8: Retrieve Backed-Up Configuration
+            # ---------------------------------------------
+            - name: RetrieveTableConfig
+              action: aws:executeScript
+              inputs:
+                Runtime: python3.11
+                Handler: retrieve_config
+                Script: |
+                  import boto3
+                  import json
+                  from botocore.exceptions import ClientError
+                  
+                  s3 = boto3.client('s3')
+                  
+                  def retrieve_config(events, context):
+                    config_key = events['ConfigKey']
+                    bucket_name = events['BucketName']
+
+                    if not config_key:
+                        print("ConfigKey is None, skipping config application.")
+                        return {"ConfigData": "{}"} 
+                    
+                    try:
+                        print(f"Retrieving config from s3://{bucket_name}/{config_key}")
+                        response = s3.get_object(Bucket=bucket_name, Key=config_key)
+                        config_data = response['Body'].read().decode('utf-8')
+                        return {"ConfigData": config_data} 
+                    except ClientError as e:
+                        if e.response['Error']['Code'] == 'NoSuchKey':
+                            print("Config file not found in S3. Returning empty config.")
+                            return {"ConfigData": "{}"}
+                        raise
+                InputPayload:
+                  ConfigKey: "{{ BackupTableConfig.ConfigKey }}"
+                  BucketName: "${TableConfigBucket}"
+              outputs:
+                - Name: ConfigData
+                  Selector: "$.Payload.ConfigData" 
+                  Type: String
+
+            
+            # ---------------------------------------------
+            # STEP 9: Apply Configuration to Restored Table
+            # ---------------------------------------------
+            - name: UpdateTableWithConfig
+              action: aws:executeScript
+              inputs:
+                Runtime: python3.11
+                Handler: apply_config
+                Script: |
+                  import boto3
+                  import json
+                  
+                  def apply_config(events, context):
+                    ddb = boto3.client('dynamodb')
+                    config_string = events['ConfigData']
+                    restored_table = events['RestoredTable']
+                    
+                    if config_string == "{}":
+                        print("Received empty configuration. Skipping configuration updates.")
+                        return {'Status': 'Skipped'}
+
+                    try:
+                        config = json.loads(config_string)
+                    except json.JSONDecodeError:
+                        print("Failed to decode configuration JSON. Skipping update.")
+                        return {'Status': 'Skipped'}
+
+                    # 1. Update TTL
+                    if config.get('TimeToLiveAttributeName'):
+                      print(f"Applying TTL: {config['TimeToLiveAttributeName']}")
+                      ddb.update_time_to_live(
+                        TableName=restored_table,
+                        TimeToLiveSpecification={
+                          'Enabled': True,
+                          'AttributeName': config['TimeToLiveAttributeName']
+                        }
+                      )
+                      
+                    # 2. Update Tags
+                    if config.get('Tags'):
+                      print(f"Applying {len(config['Tags'])} Tags.")
+                      restored_table_arn = ddb.describe_table(TableName=restored_table)['Table']['TableArn']
+                      ddb.tag_resource(
+                        ResourceArn=restored_table_arn,
+                        Tags=config['Tags']
+                      )
+                    
+                    return {'Status': 'Applied'}
+
+                InputPayload:
+                  RestoredTable: "{{ RestoreTableFromPITR.RestoredTable }}"
+                  ConfigData: "{{ RetrieveTableConfig.ConfigData }}"
+              outputs:
+                - Name: ConfigApplyStatus
+                  Selector: "$.Payload.Status"
+                  Type: String
+              
+Outputs:
+  SSMDocumentName:
+    Description: The name of the SSM Automation Document to execute for a rollback/self-heal operation.
+    Value: !Ref DynamoDBRollbackRunbook
+  ApproverRoleArn:
+    Description: The ARN of the IAM Role authorized to approve manual steps.
+    Value: !GetAtt ApproverIAMRole.Arn
+  ConfigBucketName:
+    Description: The globally unique S3 bucket created for temporary DynamoDB configuration storage.
+    Value: !Ref TableConfigBucket
