@@ -1,0 +1,561 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Deploys a comprehensive and GENERIC DynamoDB PITR Restore and Scalable Data Copy 
+  solution. Infrastructure ARNs are injected directly into the Runbook.
+ 
+Parameters:
+  ApproverRoleName:
+    Type: String
+    Default: DDBRestoreApproverRole
+    Description: Name for the dedicated IAM role authorized to approve manual SSM steps.
+  AutomationAssumeRoleName:
+    Type: String
+    Default: DDBRestoreAutomationRole
+    Description: Name for the IAM role SSM Automation will assume.
+  OriginalTableWriteRoleName:
+    Type: String
+    Default: DDBTableWriteAccessRole
+    Description: Name for the IAM role used by the Step Function to write data back to the original table.
+ 
+Resources:
+  
+  # ----------------------------------------------------------------------
+  # 1. IAM Roles 
+  # ----------------------------------------------------------------------
+  ApproverIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref ApproverRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root' } 
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: SSMManualApprovalPermission
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'ssm:SendAutomationSignal'
+                Resource: '*' 
+  
+  AutomationAssumeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref AutomationAssumeRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: 'ssm.amazonaws.com' }
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole
+      Policies:
+        - PolicyName: DDBAndStepFunctionsPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeTable
+                  - dynamodb:RestoreTableToPointInTime
+                  - dynamodb:UpdateContinuousBackups
+                  - dynamodb:DeleteTable
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/*' 
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                  - states:DescribeExecution
+                Resource: !GetAtt DataCopyStateMachine.Arn
+  
+  OriginalTableWriteRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref OriginalTableWriteRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: 
+              Service: 'states.amazonaws.com'
+              AWS: !GetAtt LambdaExecutionRole.Arn 
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: DDBWriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:BatchWriteItem
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/*'
+  
+  StepFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: 'states.amazonaws.com' }
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: StepFunctionPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'lambda:InvokeFunction'
+                Resource: !GetAtt DataCopyLambda.Arn
+              - Effect: Allow
+                Action: 'iam:PassRole'
+                Resource: !GetAtt OriginalTableWriteRole.Arn
+  
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: 'lambda.amazonaws.com' }
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DataCopyLambdaPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'sts:AssumeRole'
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${OriginalTableWriteRoleName}' 
+ 
+  # ----------------------------------------------------------------------
+  # 3. Lambda
+  # ----------------------------------------------------------------------
+  DataCopyLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: python3.11
+      Timeout: 900
+      MemorySize: 512
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from boto3.dynamodb.conditions import Key
+          import time
+ 
+          sts_client = boto3.client('sts')
+ 
+          def lambda_handler(event, context):
+              print(f"Received event: {event}")
+              
+              source_table_name = event['SourceTable']
+              dest_table_name = event['DestinationTable']
+              write_role_arn = event['WriteRoleArn']
+              data_copy_type = event.get('DataCopyType', 'FULL').upper()
+              filter_field = event.get('FilterField')
+              filter_value = event.get('FilterValueOrRange')
+              
+              exclusive_start_key = event.get('LastEvaluatedKey')
+              
+              try:
+                  assumed_role = sts_client.assume_role(
+                      RoleArn=write_role_arn,
+                      RoleSessionName=f"DDBDataCopySession_{context.aws_request_id}"
+                  )
+                  creds = assumed_role['Credentials']
+                  dynamodb_resource = boto3.resource(
+                      'dynamodb', 
+                      aws_access_key_id=creds['AccessKeyId'], 
+                      aws_secret_access_key=creds['SecretAccessKey'], 
+                      aws_session_token=creds['SessionToken']
+                  )
+              except Exception as e:
+                  print(f"Failed to assume role {write_role_arn}: {e}")
+                  raise
+ 
+              source = dynamodb_resource.Table(source_table_name)
+              dest = dynamodb_resource.Table(dest_table_name)
+ 
+              scan_kwargs = {'Limit': 4000}
+              if exclusive_start_key:
+                  scan_kwargs['ExclusiveStartKey'] = exclusive_start_key
+ 
+              if data_copy_type == 'FILTERED' and filter_field and filter_value:
+                  from boto3.dynamodb.conditions import Key
+                  scan_kwargs['FilterExpression'] = Key(filter_field).eq(filter_value)
+              
+              response = source.scan(**scan_kwargs)
+              items = response.get('Items', [])
+              
+              if items:
+                  with dest.batch_writer() as writer:
+                      for item in items:
+                          writer.put_item(Item=item)
+ 
+              last_evaluated_key = response.get('LastEvaluatedKey')
+              
+              output = {
+                  "SourceTable": source_table_name,
+                  "DestinationTable": dest_table_name,
+                  "WriteRoleArn": write_role_arn,
+                  "DataCopyType": data_copy_type,
+                  "FilterField": filter_field,
+                  "FilterValueOrRange": filter_value,
+                  "ItemsWritten": len(items),
+                  "LastEvaluatedKey": last_evaluated_key,
+                  "IsFinished": last_evaluated_key is None
+              }
+              return output
+  
+  # ----------------------------------------------------------------------
+  # 4. Step Function (FIXED: OutputPath added and comments removed from JSON)
+  # ----------------------------------------------------------------------
+  DataCopyStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: 'DDBRestoreDataCopyStateMachine'
+      RoleArn: !GetAtt StepFunctionExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Iteratively scans a source DDB table and batch-writes to a destination DDB table.",
+          "StartAt": "CopyPage",
+          "States": {
+            "CopyPage": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${DataCopyLambda.Arn}",
+                "Payload.$": "$"
+              },
+              "OutputPath": "$.Payload", 
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException",
+                    "DynamoDB.ProvisionedThroughputExceededException"
+                  ],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 6,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "FailCopy",
+                  "ResultPath": "$.Error"
+                }
+              ],
+              "Next": "IsFinished"
+            },
+            "IsFinished": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.IsFinished",
+                  "BooleanEquals": false,
+                  "Next": "WaitBeforeNextPage"
+                }
+              ],
+              "Default": "SuccessCopy"
+            },
+            "WaitBeforeNextPage": {
+              "Type": "Wait",
+              "Seconds": 3,
+              "Next": "CopyPage"
+            },
+            "SuccessCopy": { "Type": "Succeed" },
+            "FailCopy": {
+              "Type": "Fail",
+              "Cause": "The data copy process failed."
+            }
+          }
+        }
+  
+  # ----------------------------------------------------------------------
+  # 5. SSM Automation Document (FIXED: executionArn case and unique name)
+  # ----------------------------------------------------------------------
+  DynamoDBRestoreRunbook:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Name: 'DDB_PITR_Restore_And_Selective_Copy_V11' # <-- UNIQUE NAME
+      Content: 
+        !Sub |
+          schemaVersion: "0.3"
+          description: "DynamoDB PITR restore + large data copy runbook (Resources Pre-Injected)"
+          assumeRole: "${AutomationAssumeRole.Arn}"
+          parameters:
+            OriginalTableName:
+              type: String
+              description: Original DynamoDB table name (REQUIRED at runtime)
+            PITRTimestamp:
+              type: String
+              description: ISO timestamp to restore from PITR (e.g., 2025-12-10T23:59:35Z)
+            DataCopyType:
+              type: String
+              description: FULL or FILTERED
+              default: FULL
+            FilterField:
+              type: String
+              description: Field name to filter (optional, required if DataCopyType=FILTERED)
+              default: ""
+            FilterValueOrRange:
+              type: String
+              description: Value or range for filtered copy (optional, required if DataCopyType=FILTERED)
+              default: ""
+            ApproverPrincipalArn:
+              type: String
+              description: The IAM principal (User/Role/Assumed Role ARN) authorized to approve the manual steps.
+              default: ""
+          mainSteps:
+            - name: CheckIfTableExists
+              action: aws:executeScript
+              inputs:
+                Runtime: python3.11
+                Handler: check_table
+                Script: |
+                  import boto3
+                  def check_table(events, context):
+                    ddb = boto3.client('dynamodb')
+                    table = events['OriginalTableName']
+                    exists = True
+                    try:
+                      ddb.describe_table(TableName=table)
+                    except ddb.exceptions.ResourceNotFoundException:
+                      exists = False
+                    return {'TableExists': exists}
+                InputPayload:
+                  OriginalTableName: "{{ OriginalTableName }}"
+              outputs:
+                - Name: TableExists
+                  Selector: "$.Payload.TableExists"
+                  Type: Boolean
+            - name: CheckOrEnablePITR
+              action: aws:executeScript
+              inputs:
+                Runtime: python3.11
+                Handler: enable_pitr
+                Script: |
+                  import boto3
+                  import time
+                  
+                  def enable_pitr(events, context):
+                    ddb = boto3.client('dynamodb')
+                    table = events['OriginalTableName']
+                    max_retries = 36 # 6 minutes total wait
+                    
+                    print(f"Checking PITR status for table: {table}")
+ 
+                    # --- CHECK AND INITIATE ENABLEMENT ---
+                    try:
+                      response = ddb.describe_continuous_backups(TableName=table)
+                      status = response['ContinuousBackupsDescription']['PointInTimeRecoveryDescription']['PointInTimeRecoveryStatus']
+                      print(f"Current PITR Status: {status}")
+ 
+                      if status == 'DISABLED':
+                        print("PITR is DISABLED. Initiating enablement.")
+                        ddb.update_continuous_backups(
+                            TableName=table, 
+                            PointInTimeRecoverySpecification={'PointInTimeRecoveryEnabled': True}
+                        )
+                        status = 'ENABLING'
+ 
+                      if status == 'ENABLED':
+                        print("PITR is already ENABLED. Proceeding.")
+                        return {'PITREnabledStatus': 'ENABLED'}
+                        
+                    except Exception as e:
+                        print(f"Error during initial check/enablement: {e}")
+                        raise
+ 
+                    # --- WAIT FOR ENABLING TO COMPLETE ---
+                    if status == 'ENABLING':
+                        print("PITR is ENABLING. Starting wait loop...")
+                        for i in range(max_retries):
+                            time.sleep(10)
+                            response = ddb.describe_continuous_backups(TableName=table)
+                            current_status = response['ContinuousBackupsDescription']['PointInTimeRecoveryDescription']['PointInTimeRecoveryStatus']
+                            print(f"Attempt {i+1}/{max_retries}: Current status is {current_status}")
+ 
+                            if current_status == 'ENABLED':
+                                print("PITR successfully transitioned to ENABLED.")
+                                return {'PITREnabledStatus': 'ENABLED'}
+                            
+                            if current_status == 'DISABLED':
+                                raise Exception(f"PITR status unexpectedly reverted to DISABLED during wait.")
+ 
+                        raise Exception(f"PITR failed to reach ENABLED state within {max_retries * 10} seconds.")
+ 
+                    return {'PITREnabledStatus': status}
+                InputPayload:
+                  OriginalTableName: "{{ OriginalTableName }}"
+              outputs:
+                - Name: PITREnabledStatus
+                  Selector: "$.Payload.PITREnabledStatus"
+                  Type: String
+            
+            - name: AskRestoreTime
+              action: aws:approve
+              onFailure: Abort
+              inputs:
+                Message: "Confirm PITR restore timestamp: {{ PITRTimestamp }}. Approve to continue with table restoration."
+                Approvers:
+                  - "{{ ApproverPrincipalArn }}"
+            
+            - name: RestoreTableFromPITR
+              action: aws:executeScript
+              inputs:
+                Runtime: python3.11
+                Handler: restore_table
+                Script: |
+                  import boto3
+                  from datetime import datetime
+                  def restore_table(events, context):
+                    ddb = boto3.client('dynamodb')
+                    table = events['OriginalTableName']
+                    restore_time_str = events['PITRTimestamp']
+                    restore_time = datetime.fromisoformat(restore_time_str.replace('Z', '+00:00'))
+                    target_table = table + '_restore'
+                    ddb.restore_table_to_point_in_time(SourceTableName=table, TargetTableName=target_table, RestoreDateTime=restore_time)
+                    return {'RestoredTable': target_table}
+                InputPayload:
+                  OriginalTableName: "{{ OriginalTableName }}"
+                  PITRTimestamp: "{{ PITRTimestamp }}"
+              outputs:
+                - Name: RestoredTable
+                  Selector: "$.Payload.RestoredTable"
+                  Type: String
+            - name: WaitForRestoredTableActive
+              action: aws:waitForAwsResourceProperty
+              timeoutSeconds: 86400
+              inputs:
+                Service: DynamoDb
+                Api: DescribeTable
+                PropertySelector: Table.TableStatus
+                DesiredValues: ["ACTIVE"]
+                TableName: "{{ RestoreTableFromPITR.RestoredTable }}"
+            - name: AskCopyDataAndRole
+              action: aws:approve
+              onFailure: Abort
+              inputs:
+                Message: "Confirm data copy: Type={{ DataCopyType }}, Filter={{ FilterField }}. Approving starts the long-running Step Function."
+                Approvers:
+                  - "{{ ApproverPrincipalArn }}"
+            - name: StartDataCopySF
+              action: aws:executeScript
+              inputs:
+                Runtime: python3.11
+                Handler: start_execution
+                Script: |
+                  import boto3
+                  import json
+                  
+                  def start_execution(events, context):
+                    sfn = boto3.client('stepfunctions')
+                    state_machine_arn = events['DataCopyStepFunctionArn']
+                    
+                    sf_input = {
+                        "SourceTable": events['RestoredTable'],
+                        "DestinationTable": events['OriginalTableName'],
+                        "DataCopyType": events['DataCopyType'],
+                        "FilterField": events['FilterField'],
+                        "FilterValueOrRange": events['FilterValueOrRange'],
+                        "WriteRoleArn": events['OriginalTableWriteRole']
+                    }
+                    
+                    response = sfn.start_execution(
+                        stateMachineArn=state_machine_arn,
+                        input=json.dumps(sf_input)
+                    )
+                    
+                    return {'SFExecutionArn': response['executionArn']} 
+ 
+                InputPayload:
+                  DataCopyStepFunctionArn: "${DataCopyStateMachine.Arn}"
+                  RestoredTable: "{{ RestoreTableFromPITR.RestoredTable }}"
+                  OriginalTableName: "{{ OriginalTableName }}"
+                  DataCopyType: "{{ DataCopyType }}"
+                  FilterField: "{{ FilterField }}"
+                  FilterValueOrRange: "{{ FilterValueOrRange }}"
+                  OriginalTableWriteRole: "${OriginalTableWriteRole.Arn}"
+              outputs:
+                - Name: SFExecutionArn
+                  Selector: "$.Payload.SFExecutionArn"
+                  Type: String
+ 
+            - name: WaitForDataCopy
+              action: aws:waitForAwsResourceProperty
+              timeoutSeconds: 86400
+              inputs:
+                Service: StepFunctions
+                Api: DescribeExecution
+                PropertySelector: "$.status"
+                DesiredValues:
+                  - SUCCEEDED
+                  - FAILED
+                executionArn: "{{ StartDataCopySF.SFExecutionArn }}"
+              
+            - name: CleanUpSFExecution
+              action: aws:executeScript
+              inputs:
+                Runtime: python3.11
+                Handler: verify_status
+                Script: |
+                  import boto3
+                  def verify_status(events, context):
+                    sfn = boto3.client('stepfunctions')
+                    execution_arn = events['SFExecutionArn']
+                    response = sfn.describe_execution(executionArn=execution_arn)
+                    
+                    if response['status'] == 'FAILED':
+                      output = response.get('output', 'N/A')
+                      raise Exception(f"Data copy Step Function failed: Execution ARN: {execution_arn}, Output: {output}")
+                    
+                    return {'CopyStatus': 'Complete'}
+                InputPayload:
+                  SFExecutionArn: "{{ StartDataCopySF.SFExecutionArn }}"
+              outputs:
+                - Name: CopyStatus
+                  Selector: "$.Payload.CopyStatus"
+                  Type: String
+ 
+            - name: CleanupRestoredTable
+              action: aws:executeScript
+              inputs:
+                Runtime: python3.11
+                Handler: delete_table
+                Script: |
+                  import boto3
+                  def delete_table(events, context):
+                    ddb = boto3.client('dynamodb')
+                    table = events['RestoredTable']
+                    ddb.delete_table(TableName=table)
+                    return {'Status': 'Deleted'}
+                InputPayload:
+                  RestoredTable: "{{ RestoreTableFromPITR.RestoredTable }}"
+              outputs:
+                - Name: CleanupStatus
+                  Selector: "$.Payload.Status"
+                  Type: String
+ 
+Outputs:
+  SSMDocumentName:
+    Description: The name of the SSM Automation Document to execute.
+    Value: !Ref DynamoDBRestoreRunbook
+  ApproverRoleArn:
+    Description: The ARN of the IAM Role authorized to approve manual steps (The principal provided must be able to assume this role).
+    Value: !GetAtt ApproverIAMRole.Arn
